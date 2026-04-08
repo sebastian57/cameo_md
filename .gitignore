@@ -1,1 +1,6 @@
-
+runs
+outputs/*
+*.dump
+log.lammps
+core*
+*.out

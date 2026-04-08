@@ -1,0 +1,60 @@
+variable data_file         string "/p/project1/cameo/schmidt36/cameo_md/structures/config_3500.data"
+variable model_file        string "/p/project1/cameo/schmidt36/cameo_md/models/training_exp_configs_phase3_longer.mlir"
+variable dump_dir          string "/p/project1/cameo/schmidt36/cameo_md/outputs/chemtrain_phase3_longer/"
+
+variable temp              equal 320.0
+variable dt_fs             equal 1.0
+variable eq_steps          equal 50000
+variable sample_steps      equal 20000
+variable sample_stride     equal 10
+variable langevin_damp_fs  equal 100.0
+
+# chemtrain_deploy settings
+variable xla_mem_fraction  equal 0.90
+variable comm_cutoff       equal 14.0
+variable ghost_mult        equal 1.2
+variable edge_mult         equal 1.1
+
+units           real
+atom_style      atomic
+dimension       3
+boundary        s s s
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes once no
+
+read_data       ${data_file}
+
+# Keep only if your data file does not provide masses.
+mass * 12.01
+
+comm_modify     cutoff ${comm_cutoff}
+pair_style      chemtrain_deploy cuda12 ${xla_mem_fraction}
+pair_coeff      * * ${model_file} ${ghost_mult} ${edge_mult}
+
+timestep        ${dt_fs}
+
+thermo          5000
+thermo_style    custom step temp press pe ke etotal
+
+# --- Minimization (no frozen coordinates) ---
+min_style       cg
+minimize        1.0e-4 1.0e-6 200 2000
+
+# --- NVE + Langevin equilibration ---
+velocity        all create ${temp} 12345 mom yes rot no dist gaussian
+fix             int  all nve
+fix             bath all langevin ${temp} ${temp} ${langevin_damp_fs} 24680 zero yes
+
+run             ${eq_steps}
+write_restart   ${dump_dir}/restart.eq
+
+# --- Sampling ---
+reset_timestep  0
+
+dump            dprod all custom ${sample_stride} ${dump_dir}/cg_forces.dump id type x y z fx fy fz
+dump_modify     dprod sort id format line "%d %d %.8f %.8f %.8f %.10f %.10f %.10f"
+
+run             ${sample_steps}
+
+write_restart   ${dump_dir}/restart.prod
