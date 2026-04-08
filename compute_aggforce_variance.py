@@ -4,67 +4,55 @@
 Workflow:
   1. Read a LAMMPS custom dump of all protein atoms (IDs 1..N_prot) that includes
      fx, fy, fz columns.
-  2. Apply aggforce optimal linear force projection onto the CA beads.
+  2. Apply aggforce force projection onto the CA beads.
   3. Compute per-CA variance across the trajectory and write CSV output.
 
-The dump must be produced with:
-    dump  dprot protein custom <stride> protein_forces.dump id type x y z fx fy fz
-    dump_modify dprot sort id format line "%d %d %.8f %.8f %.8f %.10f %.10f %.10f"
-
-where the 'protein' group contains exactly the protein segment atoms
-(LAMMPS IDs 1..N_PROTEIN, default 1390).
-
-Usage:
-    python compute_aggforce_variance.py \\
-        --dump protein_forces.dump \\
-        --ca-ids ca_atom_ids.txt \\
-        --out aggforce_ca_variance.csv \\
-        [--n-protein 1390] [--blocks 4] [--block-out aggforce_ca_variance_blocks.csv]
+Notes on metric comparison:
+  - `RMS per-comp` is sqrt(mean(var_fx,var_fy,var_fz)) and is the apples-to-apples
+    quantity to compare against component-wise force RMSE values from cameo_cg.
+  - `RMS |F| noise` is sqrt(mean(var|F|^2)) and is larger by construction.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Iterator, List, Tuple
 
 import numpy as np
-from aggforce import LinearMap, project_forces
+from aggforce import LinearMap, guess_pairwise_constraints, project_forces
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dump", type=Path, required=True,
-                   help="LAMMPS custom dump with protein-atom positions and forces")
-    p.add_argument("--ca-ids", type=Path, required=True,
-                   help="File with LAMMPS CA atom IDs (one per line)")
-    p.add_argument("--out", type=Path, default=Path("aggforce_ca_variance.csv"),
-                   help="Per-CA variance output CSV")
-    p.add_argument("--block-out", type=Path, default=Path("aggforce_ca_variance_blocks.csv"),
-                   help="Block-convergence summary CSV")
-    p.add_argument("--n-protein", type=int, default=1390,
-                   help="Number of protein atoms (LAMMPS IDs 1..N); default 1390")
-    p.add_argument("--blocks", type=int, default=4,
-                   help="Number of time blocks for convergence summary; default 4")
-    p.add_argument("--max-frames", type=int, default=0,
-                   help="If >0, subsample this many frames uniformly from the dump (reduces memory)")
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--dump", type=Path, required=True, help="LAMMPS custom dump with protein-atom positions and forces")
+    p.add_argument("--ca-ids", type=Path, required=True, help="File with LAMMPS CA atom IDs (one per line)")
+    p.add_argument("--out", type=Path, default=Path("aggforce_ca_variance.csv"), help="Per-CA variance output CSV")
+    p.add_argument("--block-out", type=Path, default=Path("aggforce_ca_variance_blocks.csv"), help="Block-convergence summary CSV")
+    p.add_argument("--summary-out", type=Path, default=Path("aggforce_ca_variance_summary.json"), help="Summary JSON with comparable RMS metrics")
+    p.add_argument("--n-protein", type=int, required=True, help="Number of protein atoms (LAMMPS IDs 1..N)")
+    p.add_argument("--blocks", type=int, default=4, help="Number of time blocks for convergence summary; default 4")
+    p.add_argument("--max-frames", type=int, default=0, help="If >0, subsample this many frames uniformly from the dump")
+    p.add_argument(
+        "--constraint-mode",
+        type=str,
+        default="data_prep",
+        choices=("data_prep", "auto", "none"),
+        help="Constraint mode: data_prep (matches cg_1bead.py), auto, or none",
+    )
+    p.add_argument("--constraint-threshold", type=float, default=1.0e-3, help="Threshold for data_prep constraint guessing")
+    p.add_argument("--constraint-frames", type=int, default=10, help="Frames used for data_prep constraint guessing")
+    p.add_argument(
+        "--allow-fallback-none",
+        action="store_true",
+        help="If projection fails, retry unconstrained mapping instead of failing",
+    )
     return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Dump parser
-# ---------------------------------------------------------------------------
-
-def parse_dump_frames(
-    path: Path,
-    n_atoms: int,
-) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+def parse_dump_frames(path: Path, n_atoms: int) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
     """Yield (R, F) per frame as float64 arrays of shape (n_atoms, 3).
 
     Expects columns: id type x y z fx fy fz, sorted by id (IDs 1..n_atoms).
@@ -78,7 +66,7 @@ def parse_dump_frames(
             if not line.startswith("ITEM: TIMESTEP"):
                 continue
 
-            if not fh.readline():           # timestep value
+            if not fh.readline():
                 return
             if not fh.readline().startswith("ITEM: NUMBER OF ATOMS"):
                 continue
@@ -87,14 +75,15 @@ def parse_dump_frames(
             except ValueError:
                 continue
             if n != n_atoms:
-                # skip frames with unexpected atom count
                 for _ in range(n + 4):
                     fh.readline()
                 continue
 
             if not fh.readline().startswith("ITEM: BOX BOUNDS"):
                 continue
-            fh.readline(); fh.readline(); fh.readline()  # 3 box lines
+            fh.readline()
+            fh.readline()
+            fh.readline()
 
             if not fh.readline().startswith("ITEM: ATOMS"):
                 continue
@@ -102,7 +91,7 @@ def parse_dump_frames(
             R = np.empty((n_atoms, 3), dtype=np.float64)
             F = np.empty((n_atoms, 3), dtype=np.float64)
             ok = True
-            for i in range(n_atoms):
+            for _ in range(n_atoms):
                 raw = fh.readline()
                 if not raw:
                     ok = False
@@ -112,7 +101,7 @@ def parse_dump_frames(
                     ok = False
                     break
                 try:
-                    idx = int(cols[0]) - 1          # LAMMPS 1-indexed → 0-indexed
+                    idx = int(cols[0]) - 1
                     R[idx, 0] = float(cols[2])
                     R[idx, 1] = float(cols[3])
                     R[idx, 2] = float(cols[4])
@@ -126,19 +115,13 @@ def parse_dump_frames(
                 yield R, F
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def load_ca_ids(path: Path) -> List[int]:
-    """Return list of LAMMPS CA atom IDs (1-indexed) from a text file."""
-    ids = []
+    ids: List[int] = []
     with path.open() as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
-            # accept "index  id" (two columns) or just "id" (one column)
             parts = line.split()
             try:
                 ids.append(int(parts[-1]))
@@ -150,17 +133,20 @@ def load_ca_ids(path: Path) -> List[int]:
 
 
 def ca_indices_in_protein(ca_lammps_ids: List[int]) -> List[int]:
-    """Convert 1-indexed LAMMPS IDs to 0-indexed positions in the protein array.
-
-    Valid because protein atoms have LAMMPS IDs 1..N_prot stored contiguously,
-    so index = lammps_id - 1.
-    """
     return [i - 1 for i in ca_lammps_ids]
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _constraints_from_mode(mode: str, coords: np.ndarray, threshold: float, n_frames: int):
+    if mode == "auto":
+        return "auto", "auto"
+    if mode == "none":
+        return set(), "none"
+
+    # Match cameo_cg/data_prep/cg_1bead.py behavior
+    n_probe = max(1, min(int(n_frames), int(coords.shape[0])))
+    constraints = guess_pairwise_constraints(coords[:n_probe], threshold=float(threshold))
+    return constraints, "data_prep"
+
 
 def main() -> None:
     args = parse_args()
@@ -171,17 +157,18 @@ def main() -> None:
         sys.exit(f"ERROR: CA IDs file not found: {args.ca_ids}")
     if args.blocks < 1:
         sys.exit("ERROR: --blocks must be >= 1")
+    if args.n_protein < 1:
+        sys.exit("ERROR: --n-protein must be >= 1")
 
     ca_lammps_ids = load_ca_ids(args.ca_ids)
     ca_idx = ca_indices_in_protein(ca_lammps_ids)
     n_ca = len(ca_idx)
-    n_prot = args.n_protein
+    n_prot = int(args.n_protein)
 
     print(f"Protein atoms : {n_prot}")
     print(f"CA atoms      : {n_ca}")
     print(f"Dump file     : {args.dump}")
 
-    # --- Load all frames into memory ---
     R_list, F_list = [], []
     for R, F in parse_dump_frames(args.dump, n_prot):
         R_list.append(R)
@@ -191,57 +178,58 @@ def main() -> None:
         sys.exit("ERROR: no complete frames parsed from dump.")
 
     n_frames_total = len(R_list)
-
-    # Optional uniform subsampling to cap memory usage
     if args.max_frames > 0 and n_frames_total > args.max_frames:
         indices = np.round(np.linspace(0, n_frames_total - 1, args.max_frames)).astype(int)
         R_list = [R_list[i] for i in indices]
         F_list = [F_list[i] for i in indices]
-        print(f"Subsampled    : {n_frames_total} → {len(R_list)} frames (--max-frames)")
+        print(f"Subsampled    : {n_frames_total} -> {len(R_list)} frames (--max-frames)")
 
     n_frames = len(R_list)
-    coords = np.stack(R_list, axis=0)   # (n_frames, n_prot, 3)
-    forces = np.stack(F_list, axis=0)   # (n_frames, n_prot, 3)
+    coords = np.stack(R_list, axis=0)
+    forces = np.stack(F_list, axis=0)
     del R_list, F_list
-    print(f"Loaded frames : {n_frames}  →  coords {coords.shape}, forces {forces.shape}")
+    print(f"Loaded frames : {n_frames}  ->  coords {coords.shape}, forces {forces.shape}")
 
-    # --- Build aggforce LinearMap ---
-    # Each CG bead maps to exactly one CA atom; indices are into protein-only array.
     cmap = LinearMap([[i] for i in ca_idx], n_fg_sites=n_prot)
+    constrained_inds, mode_used = _constraints_from_mode(
+        args.constraint_mode,
+        coords,
+        threshold=args.constraint_threshold,
+        n_frames=args.constraint_frames,
+    )
+    print(f"Running aggforce project_forces (constraint_mode={args.constraint_mode}, mode_used={mode_used})...")
 
-    # --- Project forces ---
-    # Try auto constraint detection first; fall back to no constraints if it fails
-    # (can fail with a matmul dimension error on some proteins due to degenerate constraints).
-    print("Running aggforce project_forces (auto constraint detection)...")
     try:
         result = project_forces(
             coords=coords,
             forces=forces,
             coord_map=cmap,
-            constrained_inds="auto",
+            constrained_inds=constrained_inds,
         )
-        n_constraints = len(result["constraints"])
-        print(f"  Detected constraints : {n_constraints}")
-    except (ValueError, np.linalg.LinAlgError) as e:
-        print(f"  WARNING: auto-constraint projection failed ({e}); retrying with no constraints.")
+        constraint_info = result.get("constraints", None)
+        n_constraints = len(constraint_info) if constraint_info is not None else 0
+    except Exception as e:
+        if not args.allow_fallback_none:
+            raise
+        print(f"  WARNING: projection failed ({e}); retrying with no constraints.")
         result = project_forces(
             coords=coords,
             forces=forces,
             coord_map=cmap,
             constrained_inds=set(),
         )
-        n_constraints = 0
-        print(f"  Detected constraints : 0 (fallback)")
-    mapped_forces = result["mapped_forces"]  # (n_frames, n_ca, 3)
-    residual = result["residual"]
+        mode_used = f"{mode_used}_fallback_none"
+        constraint_info = result.get("constraints", None)
+        n_constraints = len(constraint_info) if constraint_info is not None else 0
+
+    mapped_forces = result["mapped_forces"]
+    residual = float(result.get("residual", np.nan))
+    print(f"  Detected constraints : {n_constraints}")
     print(f"  Projection residual  : {residual:.6e}  (mean squared mapped force)")
 
-    # --- Compute per-CA variance across frames ---
-    # var shape: (n_ca, 3)
-    var = np.var(mapped_forces, axis=0, ddof=1)   # unbiased, (n_ca, 3)
-    var_fmag2 = var.sum(axis=1)                    # (n_ca,)
+    var = np.var(mapped_forces, axis=0, ddof=1)
+    var_fmag2 = var.sum(axis=1)
 
-    # --- Write per-atom CSV ---
     with args.out.open("w") as g:
         print("id,n_samples,var_fx,var_fy,var_fz,var_fmag2", file=g)
         for k, lammps_id in enumerate(ca_lammps_ids):
@@ -252,21 +240,23 @@ def main() -> None:
             )
     print(f"Wrote per-CA CSV : {args.out}")
 
-    # --- Block convergence summary ---
     block_rows = []
     for b in range(args.blocks):
         i0 = (b * n_frames) // args.blocks
         i1 = ((b + 1) * n_frames) // args.blocks
-        blk = mapped_forces[i0:i1]                        # (blk_frames, n_ca, 3)
+        blk = mapped_forces[i0:i1]
         blk_n = blk.shape[0]
         if blk_n < 2:
             continue
-        blk_var = np.var(blk, axis=0, ddof=1)            # (n_ca, 3)
-        block_rows.append((b + 1, blk_n,
-                           blk_var[:, 0].mean(),
-                           blk_var[:, 1].mean(),
-                           blk_var[:, 2].mean(),
-                           blk_var.sum(axis=1).mean()))
+        blk_var = np.var(blk, axis=0, ddof=1)
+        block_rows.append((
+            b + 1,
+            blk_n,
+            blk_var[:, 0].mean(),
+            blk_var[:, 1].mean(),
+            blk_var[:, 2].mean(),
+            blk_var.sum(axis=1).mean(),
+        ))
 
     with args.block_out.open("w") as g:
         print("block,n_frames,n_atoms,mean_var_fx,mean_var_fy,mean_var_fz,mean_var_fmag2", file=g)
@@ -278,20 +268,41 @@ def main() -> None:
             )
     print(f"Wrote block CSV  : {args.block_out}")
 
-    # --- Summary ---
     global_var = np.var(mapped_forces, axis=0, ddof=1)
-    mfx = global_var[:, 0].mean()
-    mfy = global_var[:, 1].mean()
-    mfz = global_var[:, 2].mean()
-    mfmag2 = global_var.sum(axis=1).mean()
+    mfx = float(global_var[:, 0].mean())
+    mfy = float(global_var[:, 1].mean())
+    mfz = float(global_var[:, 2].mean())
+    mfmag2 = float(global_var.sum(axis=1).mean())
+
+    rms_per_comp = float(np.sqrt((mfx + mfy + mfz) / 3.0))
+    rms_force_magnitude = float(np.sqrt(mfmag2))
+
+    summary = {
+        "n_frames": int(n_frames),
+        "n_ca": int(n_ca),
+        "n_protein": int(n_prot),
+        "constraint_mode_requested": str(args.constraint_mode),
+        "constraint_mode_used": str(mode_used),
+        "n_constraints": int(n_constraints),
+        "projection_residual": residual,
+        "mean_var_fx": mfx,
+        "mean_var_fy": mfy,
+        "mean_var_fz": mfz,
+        "mean_var_fmag2": mfmag2,
+        "rms_per_component": rms_per_comp,
+        "rms_force_magnitude": rms_force_magnitude,
+    }
+    args.summary_out.write_text(json.dumps(summary, indent=2, sort_keys=True))
+    print(f"Wrote summary JSON: {args.summary_out}")
+
     print(
         f"\nSummary ({n_ca} CA atoms, {n_frames} frames):\n"
         f"  mean var_fx   = {mfx:.6e}  (kcal/mol/A)^2\n"
         f"  mean var_fy   = {mfy:.6e}  (kcal/mol/A)^2\n"
         f"  mean var_fz   = {mfz:.6e}  (kcal/mol/A)^2\n"
         f"  mean var|F|^2 = {mfmag2:.6e}  (kcal/mol/A)^2\n"
-        f"  RMS per-comp  = {np.sqrt((mfx+mfy+mfz)/3):.4f}  kcal/mol/A\n"
-        f"  RMS |F| noise = {np.sqrt(mfmag2):.4f}  kcal/mol/A"
+        f"  RMS per-comp  = {rms_per_comp:.4f}  kcal/mol/A  [compare to analysis force_rmse]\n"
+        f"  RMS |F| noise = {rms_force_magnitude:.4f}  kcal/mol/A"
     )
 
 

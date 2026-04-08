@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Set up fixed-CA force-variance LAMMPS runs for 5 mdCATH proteins.
+"""Set up fixed-CA force-variance LAMMPS runs for selected mdCATH proteins.
 
 For each protein:
   1. Pick a random frame from the 320 K trajectory.
@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import h5py
@@ -28,13 +27,13 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-ROOT        = Path("/p/project1/cameo/schmidt36")
-H5_DIR      = ROOT / "cameo_md/structures"
-RUNS_BASE   = ROOT / "cameo_md/runs/forcevar_320K"
-FF_SRC      = ROOT / "cameo_md/runs/4q5wA02_charmm22_cmap_fixed"  # force-field files live here
-LAMMPS_BIN  = ROOT / "lammps/build/lmp"
-C2L_PL      = ROOT / "lammps/tools/ch2lmp/charmm2lammps.pl"
-PY_ENV      = ROOT / "clean_booster_env/bin/python"
+ROOT = Path("/p/project1/cameo/schmidt36")
+H5_DIR = ROOT / "cameo_md/structures"
+RUNS_BASE = ROOT / "cameo_md/runs/forcevar_320K"
+FF_SRC = ROOT / "cameo_md/runs/4q5wA02_charmm22_cmap_fixed"  # force-field files live here
+LAMMPS_BIN = ROOT / "lammps/build/lmp"
+C2L_PL = ROOT / "lammps/tools/ch2lmp/charmm2lammps.pl"
+PY_ENV = ROOT / "clean_booster_env/bin/python"
 ANALYSIS_PY = ROOT / "cameo_md/compute_aggforce_variance.py"
 
 FF_FILES = [
@@ -43,13 +42,35 @@ FF_FILES = [
     "charmm22.cmap",
 ]
 
-PROTEINS = ["2q2tA03", "3h7jA02", "4iltC00", "4q5wA02", "5tkyA03"]
+# Requested set from user
+PROTEINS = ["2gy5A01", "4q5WA02", "4zohB01", "5k39B02"]
 
 # MD parameters
-TEMP_K        = 320
-EQ_STEPS      = 50_000   # 50 ps equilibration
-SAMPLE_STEPS  = 20_000   # 20 ps sampling
-SAMPLE_STRIDE = 10       # dump every 10 steps → 2 000 frames
+TEMP_K = 320
+EQ_STEPS = 50_000  # 50 ps equilibration
+SAMPLE_STEPS = 20_000  # 20 ps sampling
+SAMPLE_STRIDE = 10  # dump every 10 steps -> 2 000 frames
+
+
+def _available_protein_ids() -> list[str]:
+    ids: list[str] = []
+    for h5 in sorted(H5_DIR.glob("mdcath_dataset_*.h5")):
+        name = h5.stem.replace("mdcath_dataset_", "", 1)
+        if name:
+            ids.append(name)
+    return ids
+
+
+def _resolve_protein_id(requested_id: str) -> str:
+    """Resolve requested protein id against available H5 IDs (case-insensitive)."""
+    avail = _available_protein_ids()
+    lookup = {pid.lower(): pid for pid in avail}
+    key = requested_id.lower()
+    if key not in lookup:
+        raise FileNotFoundError(
+            f"No H5 dataset found for '{requested_id}'. Available: {', '.join(avail)}"
+        )
+    return lookup[key]
 
 
 # ---------------------------------------------------------------------------
@@ -57,16 +78,11 @@ SAMPLE_STRIDE = 10       # dump every 10 steps → 2 000 frames
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--seed", type=int, default=42,
-                   help="NumPy random seed for frame selection (default 42)")
-    p.add_argument("--temp-group", default="320",
-                   help="Temperature group to sample from (default '320')")
-    p.add_argument("--run-group", default="0",
-                   help="Run sub-group within the temperature group (default '0')")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Write files but do not call charmm2lammps.pl")
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--seed", type=int, default=42, help="NumPy random seed for frame selection (default 42)")
+    p.add_argument("--temp-group", default="320", help="Temperature group to sample from (default '320')")
+    p.add_argument("--run-group", default="0", help="Run sub-group within the temperature group (default '0')")
+    p.add_argument("--dry-run", action="store_true", help="Write files but do not call charmm2lammps.pl")
     return p.parse_args()
 
 
@@ -75,31 +91,22 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 def replace_protein_coords(pdb_str: str, new_coords: np.ndarray) -> str:
-    """Return the solvated PDB string with protein (P0) atom coords replaced.
-
-    new_coords: (N_prot, 3) float array in Angstrom, ordered as in the PSF/PDB.
-    PDB columns (1-indexed): x 31-38, y 39-46, z 47-54.
-    """
+    """Return the solvated PDB string with protein (P0) atom coords replaced."""
     out_lines = []
     prot_idx = 0
     for line in pdb_str.splitlines():
         if line.startswith(("ATOM", "HETATM")):
-            seg = line[72:76].strip()          # segment ID in cols 73-76
+            seg = line[72:76].strip()  # segment ID in cols 73-76
             if seg == "P0":
                 x, y, z = new_coords[prot_idx]
-                line = (line[:30]
-                        + f"{x:8.3f}{y:8.3f}{z:8.3f}"
-                        + line[54:])
+                line = line[:30] + f"{x:8.3f}{y:8.3f}{z:8.3f}" + line[54:]
                 prot_idx += 1
         out_lines.append(line)
     return "\n".join(out_lines) + "\n"
 
 
 def detect_water_angle_type(data_protein_path: Path) -> int:
-    """Return the LAMMPS angle type number for the TIP3P H-O-H angle (HT OT HT).
-
-    Falls back to 110 (the type used in 4q5wA02) if not found.
-    """
+    """Return LAMMPS angle type number for TIP3P H-O-H angle (HT OT HT)."""
     try:
         in_coeffs = False
         with data_protein_path.open() as fh:
@@ -110,32 +117,24 @@ def detect_water_angle_type(data_protein_path: Path) -> int:
                 if in_coeffs:
                     if not line.strip() or line.strip().startswith("#"):
                         continue
-                    # Stop at next section header (no leading digit)
                     if line.strip() and not line.strip()[0].isdigit():
                         break
-                    # Comment field contains atom types: "# HT   OT   HT"
                     if "HT" in line and "OT" in line:
-                        angle_type = int(line.split()[0])
-                        return angle_type
+                        return int(line.split()[0])
     except Exception:
         pass
-    return 110  # safe fallback (matches 4q5wA02)
+    return 110
 
 
 def extract_ca_ids_from_pdb(pdb_protein_atoms_str: str) -> list[int]:
-    """Return 1-indexed LAMMPS CA atom IDs from the pdbProteinAtoms PDB string.
-
-    Uses the same algorithm as cg_1bead.py: look for ATOM lines whose
-    atom-name field (cols 13-16) is exactly 'CA'.
-    LAMMPS IDs are 1-indexed positions in the protein-atom array.
-    """
+    """Return 1-indexed LAMMPS CA atom IDs from pdbProteinAtoms."""
     ids = []
-    atom_idx = 0  # 0-indexed position within protein atoms
+    atom_idx = 0
     for line in pdb_protein_atoms_str.splitlines():
         if line.startswith("ATOM"):
             atom_name = line[12:16].strip()
             if atom_name == "CA":
-                ids.append(atom_idx + 1)   # 1-indexed
+                ids.append(atom_idx + 1)
             atom_idx += 1
     return ids
 
@@ -229,45 +228,6 @@ write_restart   restart.forcevar_fixed_ca
 # SLURM script generator
 # ---------------------------------------------------------------------------
 
-def write_slurm_script(path: Path, protein_id: str, run_dir: Path) -> None:
-    content = f"""\
-#!/bin/bash -x
-#SBATCH --account=cameo
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --time=18:00:00
-#SBATCH --partition=booster
-#SBATCH --gres=gpu:1
-#SBATCH --job-name=fv_{protein_id}
-#SBATCH --output={run_dir}/slurm-%j.out
-
-source {ROOT}/load_modules.sh
-export PATH={ROOT}/lammps/build:$PATH
-export MPICH_GPU_SUPPORT_ENABLED=0
-export MPIR_CVAR_CH4_OFI_ENABLE_GPU=0
-export PSP_CUDA=0
-unset LAMMPS_PLUGIN_PATH
-
-cd {run_dir}
-
-# Run MD
-srun {LAMMPS_BIN} -in in.forcevar.lmp -log forcevar.log
-
-# Compute aggforce variance
-{PY_ENV} {ANALYSIS_PY} \\
-    --dump protein_forces.dump \\
-    --ca-ids ca_atom_ids.txt \\
-    --n-protein $(wc -l < ca_atom_ids.txt | awk '{{print NF}}') \\
-    --out aggforce_ca_variance.csv \\
-    --block-out aggforce_ca_variance_blocks.csv
-"""
-    # n-protein needs to be read from run context; simpler: embed it directly
-    # Replace the awk hack with the actual value
-    n_prot_placeholder = "$(wc -l < ca_atom_ids.txt | awk '{print NF}')"
-    content = content  # n_prot will be patched below
-    path.write_text(content)
-
-
 def write_slurm_script_with_nprot(path: Path, protein_id: str, run_dir: Path, n_prot: int) -> None:
     content = f"""\
 #!/bin/bash -x
@@ -295,6 +255,8 @@ srun {LAMMPS_BIN} -in in.forcevar.lmp -log forcevar.log
     --dump protein_forces.dump \\
     --ca-ids ca_atom_ids.txt \\
     --n-protein {n_prot} \\
+    --constraint-mode data_prep \\
+    --summary-out aggforce_ca_variance_summary.json \\
     --out aggforce_ca_variance.csv \\
     --block-out aggforce_ca_variance_blocks.csv
 """
@@ -306,109 +268,99 @@ srun {LAMMPS_BIN} -in in.forcevar.lmp -log forcevar.log
 # Per-protein setup
 # ---------------------------------------------------------------------------
 
-def setup_protein(protein_id: str, rng: np.random.Generator,
-                  temp_group: str, run_group: str, dry_run: bool) -> None:
+def setup_protein(requested_id: str, rng: np.random.Generator,
+                  temp_group: str, run_group: str, dry_run: bool) -> str | None:
     print(f"\n{'='*60}")
-    print(f"Setting up {protein_id}")
+    print(f"Setting up {requested_id}")
     print(f"{'='*60}")
 
+    try:
+        protein_id = _resolve_protein_id(requested_id)
+    except FileNotFoundError as exc:
+        print(f"SKIP {requested_id}: {exc}")
+        return None
+
     h5_path = H5_DIR / f"mdcath_dataset_{protein_id}.h5"
-    run_dir = RUNS_BASE / protein_id
+    run_dir = RUNS_BASE / requested_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Read h5 ---
     with h5py.File(h5_path, "r") as f:
-        prot = f[protein_id]
-        pdb_str            = prot["pdb"][()].decode()
-        psf_str            = prot["psf"][()].decode()
+        if protein_id in f:
+            prot = f[protein_id]
+        else:
+            first_key = next(iter(f.keys()))
+            prot = f[first_key]
+            print(f"  WARNING: expected group {protein_id}, using {first_key}")
+
+        pdb_str = prot["pdb"][()].decode()
+        psf_str = prot["psf"][()].decode()
         pdb_prot_atoms_str = prot["pdbProteinAtoms"][()].decode()
-        coords             = prot[temp_group][run_group]["coords"][()]  # (N_frames, N_prot, 3)
+        coords = prot[temp_group][run_group]["coords"][()]
 
     n_frames, n_prot, _ = coords.shape
     frame_idx = int(rng.integers(0, n_frames))
-    print(f"  Frames available : {n_frames}  →  selected frame {frame_idx}")
+    print(f"  Frames available : {n_frames}  -> selected frame {frame_idx}")
     print(f"  Protein atoms    : {n_prot}")
 
-    # --- Build updated solvated PDB ---
-    new_coords = coords[frame_idx].astype(float)   # (N_prot, 3) in Angstrom
+    new_coords = coords[frame_idx].astype(float)
     updated_pdb = replace_protein_coords(pdb_str, new_coords)
 
-    # --- Write protein.pdb / protein.psf ---
     (run_dir / "protein.pdb").write_text(updated_pdb)
     (run_dir / "protein.psf").write_text(psf_str)
     print(f"  Written protein.pdb ({n_prot} protein + water atoms)")
 
-    # --- Copy force-field files ---
     for ff_file in FF_FILES:
         shutil.copy(FF_SRC / ff_file, run_dir / ff_file)
     print(f"  Copied FF files: {FF_FILES}")
 
-    # --- Run charmm2lammps.pl ---
     if not dry_run:
         perl = shutil.which("perl") or "perl"
-        cmd = [
-            perl, str(C2L_PL),
-            "-cmap=22",
-            "all22_prot_mdcath",
-            "protein",
-        ]
-        print(f"  Running charmm2lammps.pl ...")
-        result = subprocess.run(
-            cmd,
-            cwd=run_dir,
-            capture_output=True,
-            text=True,
-        )
+        cmd = [perl, str(C2L_PL), "-cmap=22", "all22_prot_mdcath", "protein"]
+        print("  Running charmm2lammps.pl ...")
+        result = subprocess.run(cmd, cwd=run_dir, capture_output=True, text=True)
         (run_dir / "conversion.log").write_text(result.stdout + result.stderr)
         if result.returncode != 0:
             print(f"  ERROR in charmm2lammps.pl (see {run_dir}/conversion.log):")
             print(result.stderr[-500:])
-            return
-        # charmm2lammps.pl outputs protein.data; rename to data.protein
+            return None
         src = run_dir / "protein.data"
         dst = run_dir / "data.protein"
         if src.exists():
             shutil.copy(src, dst)
-            print(f"  Conversion OK → data.protein")
+            print("  Conversion OK -> data.protein")
         else:
-            print(f"  WARNING: protein.data not found after conversion")
+            print("  WARNING: protein.data not found after conversion")
     else:
         print("  [dry-run] skipping charmm2lammps.pl")
 
-    # --- Extract CA atom IDs ---
     ca_ids = extract_ca_ids_from_pdb(pdb_prot_atoms_str)
     if not ca_ids:
-        print(f"  ERROR: no CA atoms found in pdbProteinAtoms")
-        return
+        print("  ERROR: no CA atoms found in pdbProteinAtoms")
+        return None
     print(f"  CA atoms: {len(ca_ids)}  (IDs {ca_ids[0]}..{ca_ids[-1]})")
 
-    # Write ca_atom_ids.txt  (one ID per line, matching existing format)
     with (run_dir / "ca_atom_ids.txt").open("w") as g:
         for ca_id in ca_ids:
             g.write(f"{ca_id}\n")
 
-    # Write ca_group.lmp
     id_list = " ".join(str(i) for i in ca_ids)
     ca_group_content = (
-        f"# Auto-generated for {protein_id}\n"
+        f"# Auto-generated for {requested_id}\n"
         f"group ca id {id_list}\n"
         f"group mobile subtract all ca\n"
     )
     (run_dir / "ca_group.lmp").write_text(ca_group_content)
 
-    # --- Detect water angle type from converted data file ---
     water_angle_type = detect_water_angle_type(run_dir / "data.protein")
     print(f"  Water (HOH) angle type : {water_angle_type}")
 
-    # --- Write LAMMPS input ---
-    write_lammps_input(run_dir / "in.forcevar.lmp", protein_id, n_prot, water_angle_type)
+    write_lammps_input(run_dir / "in.forcevar.lmp", requested_id, n_prot, water_angle_type)
     print(f"  Written in.forcevar.lmp  (T={TEMP_K}K, eq={EQ_STEPS}, sample={SAMPLE_STEPS}, stride={SAMPLE_STRIDE})")
 
-    # --- Write SLURM script ---
-    write_slurm_script_with_nprot(
-        run_dir / "submit.sh", protein_id, run_dir, n_prot
-    )
-    print(f"  Written submit.sh")
+    write_slurm_script_with_nprot(run_dir / "submit.sh", requested_id, run_dir, n_prot)
+    print("  Written submit.sh")
+
+    return requested_id
 
 
 # ---------------------------------------------------------------------------
@@ -421,24 +373,26 @@ def main() -> None:
 
     RUNS_BASE.mkdir(parents=True, exist_ok=True)
 
-    for protein_id in PROTEINS:
-        h5_path = H5_DIR / f"mdcath_dataset_{protein_id}.h5"
-        if not h5_path.exists():
-            print(f"SKIP {protein_id}: h5 not found at {h5_path}")
-            continue
-        setup_protein(protein_id, rng,
-                      temp_group=args.temp_group,
-                      run_group=args.run_group,
-                      dry_run=args.dry_run)
+    submitted_ids: list[str] = []
+    for requested_id in PROTEINS:
+        out_id = setup_protein(
+            requested_id,
+            rng,
+            temp_group=args.temp_group,
+            run_group=args.run_group,
+            dry_run=args.dry_run,
+        )
+        if out_id is not None:
+            submitted_ids.append(out_id)
 
-    # Write a submit-all convenience script
     submit_all = RUNS_BASE / "submit_all.sh"
-    lines = ["#!/bin/bash", "# Submit all 5 force-variance jobs", ""]
-    for pid in PROTEINS:
+    lines = ["#!/bin/bash", f"# Submit all {len(submitted_ids)} force-variance jobs", ""]
+    for pid in submitted_ids:
         lines.append(f"sbatch {RUNS_BASE}/{pid}/submit.sh")
     lines.append("")
     submit_all.write_text("\n".join(lines))
     submit_all.chmod(0o755)
+
     print(f"\nWrote {submit_all}")
     print("Run with:  bash cameo_md/runs/forcevar_320K/submit_all.sh")
 
