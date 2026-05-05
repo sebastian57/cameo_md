@@ -1,0 +1,19 @@
+{
+  "bins": 80,
+  "coord_source": "auto (prefers xu/yu/zu, falls back to x/y/z)",
+  "dump": "/p/project1/cameo/schmidt36/cameo_md/outputs/charmm22_tica/ca_tica.dump",
+  "lagtime": 50,
+  "n_atoms": 53,
+  "n_frames": 4001,
+  "n_pairs": 200,
+  "outputs": {
+    "fes_grid_npz": "/p/project1/cameo/schmidt36/cameo_md/tica_results/charmm22/charmm22_fes_grid.npz",
+    "fes_png": "/p/project1/cameo/schmidt36/cameo_md/tica_results/charmm22/charmm22_tic_fes.png",
+    "pairs_csv": "/p/project1/cameo/schmidt36/cameo_md/tica_results/charmm22/charmm22_pair_indices.csv",
+    "tica_model_pkl": "/p/project1/cameo/schmidt36/cameo_md/tica_results/charmm22/charmm22_tica_model.pkl",
+    "tica_projection_csv": "/p/project1/cameo/schmidt36/cameo_md/tica_results/charmm22/charmm22_tica_projection.csv"
+  },
+  "pair_mode": "random",
+  "standardize": false,
+  "temperature": 320.0
+}

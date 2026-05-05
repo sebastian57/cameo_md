@@ -1,0 +1,66 @@
+# ML-CG comparison run with NO equilibration stage.
+#
+# This variant starts from the already equilibrated CHARMM22 structure and
+# proceeds directly to production under the ML potential.
+#
+# Build input data with:
+#   python /p/project1/cameo/schmidt36/cameo_md/build_ml_data_from_charmm_eq_dump.py \
+#     --dump /p/project1/cameo/schmidt36/cameo_md/outputs/compare_clean/charmm22/ca_eq_final.dump \
+#     --template /p/project1/cameo/schmidt36/cameo_md/structures/config_44.data \
+#     --out /p/project1/cameo/schmidt36/cameo_md/structures/config_44_from_charmm22eq_compare.data
+#
+# Comparable production settings:
+# - temperature: 320 K
+# - timestep: 1.0 fs
+# - production: 200000 steps
+# - dump stride: 50 steps
+
+variable data_file         string "/p/project1/cameo/schmidt36/cameo_md/structures/config_44_from_charmm22eq_compare.data"
+variable model_file        string "/p/project1/cameo/schmidt36/cameo_md/models/training_md_testing_cueq_fast_tiled_no_priors_symbolic_reexport.mlir"
+variable dump_dir          string "/p/project1/cameo/schmidt36/cameo_md/outputs/compare_clean/mlcg_noeq"
+
+variable temp              equal 320.0
+variable dt_fs             equal 1.0
+variable sample_steps      equal 200000
+variable sample_stride     equal 50
+variable langevin_damp_fs  equal 100.0
+
+# chemtrain_deploy settings
+variable xla_mem_fraction  equal 0.90
+variable comm_cutoff       equal 14.0
+variable ghost_mult        equal 1.2
+variable edge_mult         equal 1.1
+
+units           real
+atom_style      atomic
+dimension       3
+boundary        s s s
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes once no
+
+read_data       ${data_file}
+mass * 12.01
+
+comm_modify     cutoff ${comm_cutoff}
+pair_style      chemtrain_deploy cuda12 ${xla_mem_fraction}
+pair_coeff      * * ${model_file} ${ghost_mult} ${edge_mult}
+
+timestep        ${dt_fs}
+
+thermo          5000
+thermo_style    custom step temp press pe ke etotal
+
+min_style       cg
+minimize        1.0e-4 1.0e-6 200 2000
+
+# No extra equilibration run; start production immediately.
+fix             int  all nve
+fix             bath all langevin ${temp} ${temp} ${langevin_damp_fs} 24680 zero yes
+
+reset_timestep  0
+dump            dprod all custom ${sample_stride} ${dump_dir}/ca_tica.dump id type xu yu zu
+dump_modify     dprod sort id format line "%d %d %.8f %.8f %.8f"
+
+run             ${sample_steps}
+write_restart   ${dump_dir}/restart.prod

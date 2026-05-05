@@ -1,0 +1,139 @@
+# MLCG simulation: ML-only force field, conservative initialization for stability diagnosis.
+#
+# Mass = 12.01 Da: training kept only Cα coords and Cα forces from AA trajectories
+# (no COM-mapped forces), so the dynamics-generating mass is the carbon mass and
+# this is internally consistent with the training distribution.
+#
+# Boundaries: shrink-wrapped non-periodic (s s s).
+#   ML CG protein in vacuum has no reason for PBC. Removes self-image artifacts and
+#   makes "dissociation" unambiguous (atoms can leave; periodic re-entry is impossible).
+#
+# Box: protein-centered with generous clearance to be safe under shrink-wrap and
+# to give the neighbor list room.
+#   Regenerate with: python lmp_input_gen.py --frame 0 --cutoff 12.0 --padding 30.0 --boundary s
+#
+# comm_cutoff = 12.0 = model_cutoff(10 Å) + neighbor_skin(2 Å)
+#
+# Warm-up philosophy:
+#   1. Tight CG minimization (loose min was leaving residual forces)
+#   2. Diagnostic: print max force after minimization
+#   3. Cold start velocities (T = 10 K), strong damping (γ = 200 ps⁻¹)
+#   4. Multi-stage temperature ramp 10 K → 320 K
+#   5. Damping relaxed to production value (γ = 20 ps⁻¹) only after T is reached
+#   6. Equilibration at production conditions
+#   7. Production
+#
+# Files patched by prepare_mlcg_runs.py.
+
+variable data_file         string "/p/project1/cameo/schmidt36/cameo_md/structures/config_4z.data"
+variable model_file        string "/p/project1/cameo/schmidt36/cameo_md/models/1pro_4zoh_comparison_ml_dsm_symbolic.mlir"
+variable dump_dir          string "/p/project1/cameo/schmidt36/cameo_md/outputs/exp_1pro_tica/mlcg_ml_only_langevin"
+
+variable temp_prod         equal 320.0
+variable temp_cold         equal 10.0
+
+variable dt_fs             equal 0.1
+
+# Warm-up stages (fs); kept short — these are diagnostic, not equilibration
+variable warm1_steps       equal  50000     #   5 ps at 10 K, very strong damping
+variable ramp_steps        equal 100000     #  10 ps ramp 10 K → 320 K, strong damping
+variable warm2_steps       equal 100000     #  10 ps at 320 K, strong damping
+variable eq_steps          equal 500000     #  50 ps at 320 K, production damping
+variable sample_steps      equal 1000000    # 100 ps production
+variable sample_stride     equal 50
+
+# Damping (LAMMPS damp = 1/γ in time units of `units real`, i.e. fs)
+variable damp_strong_fs    equal 5.0        # γ = 200 ps⁻¹  (overdamped warm-up)
+variable damp_prod_fs      equal 50.0       # γ =  20 ps⁻¹  (production)
+
+# chemtrain_deploy settings
+variable xla_mem_fraction  equal 0.90
+variable comm_cutoff       equal 12.0
+variable ghost_mult        equal 1.2
+variable edge_mult         equal 1.1
+
+# ----------------------------------------------------------------------------
+units           real
+atom_style      atomic
+dimension       3
+boundary        s s s
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes once no
+
+read_data       ${data_file}
+
+# Cα-only training: mass is the carbon atom mass (see header comment).
+mass * 12.01
+
+comm_modify     cutoff ${comm_cutoff}
+
+pair_style      chemtrain_deploy cuda12 ${xla_mem_fraction}
+pair_coeff      * * ${model_file} ${ghost_mult} ${edge_mult}
+
+timestep        ${dt_fs}
+
+thermo          1000
+thermo_style    custom step temp press pe ke etotal fmax fnorm
+thermo_modify   flush yes
+
+# ----------------------------------------------------------------------------
+# Stage 0: minimization
+# Tighter than before. Failure here is a strong signal that the data file
+# geometry is off-manifold for the model.
+min_style       cg
+minimize        1.0e-6 1.0e-8 1000 10000
+
+# Diagnostic: dump per-atom forces after minimization for inspection.
+# If fmax in thermo above is large (≫ 100 kcal/mol/Å), abort and investigate
+# before running dynamics.
+write_data      ${dump_dir}/after_min.data
+dump            dmin all custom 1 ${dump_dir}/after_min_forces.dump id type xu yu zu fx fy fz
+dump_modify     dmin sort id format line "%d %d %.6f %.6f %.6f %.6e %.6e %.6e"
+run             0
+undump          dmin
+
+# ----------------------------------------------------------------------------
+# Stage 1: cold start, strong damping (overdamped regime)
+# γ = 200 ps⁻¹ at m = 12 Da gives γ·dt ≈ 0.02 — well-behaved, dissipates any
+# initial-force shock before it can integrate ballistically.
+velocity        all create ${temp_cold} 42 mom yes rot yes dist gaussian
+
+fix             int  all nve
+fix             bath all langevin ${temp_cold} ${temp_cold} ${damp_strong_fs} 24680 zero yes
+
+run             ${warm1_steps}
+
+# ----------------------------------------------------------------------------
+# Stage 2: linear temperature ramp under strong damping
+unfix           bath
+fix             bath all langevin ${temp_cold} ${temp_prod} ${damp_strong_fs} 13579 zero yes
+
+run             ${ramp_steps}
+
+# ----------------------------------------------------------------------------
+# Stage 3: hold at production T, still strong damping
+unfix           bath
+fix             bath all langevin ${temp_prod} ${temp_prod} ${damp_strong_fs} 97531 zero yes
+
+run             ${warm2_steps}
+
+# ----------------------------------------------------------------------------
+# Stage 4: relax damping to production value, equilibrate
+unfix           bath
+fix             bath all langevin ${temp_prod} ${temp_prod} ${damp_prod_fs} 11111 zero yes
+
+run             ${eq_steps}
+
+write_restart   ${dump_dir}/restart.eq
+
+# ----------------------------------------------------------------------------
+# Stage 5: production
+reset_timestep  0
+
+dump            dprod all custom ${sample_stride} ${dump_dir}/ca_tica.dump id type xu yu zu fx fy fz
+dump_modify     dprod sort id format line "%d %d %.8f %.8f %.8f %.8f %.8f %.8f"
+
+run             ${sample_steps}
+
+write_restart   ${dump_dir}/restart.prod

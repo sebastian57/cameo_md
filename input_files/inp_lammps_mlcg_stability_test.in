@@ -1,0 +1,61 @@
+# Stability test: more_data model, 10x lower timestep, longer eq.
+# Goal: reach 100 ps without dissociation.
+#
+# dt=0.1 fs  eq=50000 steps (5 ps)  prod=1000000 steps (100 ps)
+# Langevin damp=100 fs (unchanged from baseline).
+
+variable data_file         string "/p/project1/cameo/schmidt36/cameo_md/outputs/exp_1pro_tica/mlcg_ml_only/h5/4zohB01/4zohB01__h5_320_0__f00044/seed_h5.data"
+#variable model_file        string "/p/project1/cameo/schmidt36/cameo_md/models/more_data_cueq_fast_tiled_ml_only_symbolic_reexport.mlir"
+variable model_file	   string "/p/project1/cameo/schmidt36/cameo_md/models/training_md_testing_cueq_fast_tiled_priorscfg_symbolic_reexport.mlir"
+variable dump_dir          string "/p/project1/cameo/schmidt36/cameo_md/outputs/stability_test_more_data"
+
+variable temp              equal 320.0
+variable dt_fs             equal 0.1
+variable eq_steps          equal 50000
+variable sample_steps      equal 1000000
+variable sample_stride     equal 500
+variable langevin_damp_fs  equal 100.0
+variable langevin_seed     equal 42
+
+# chemtrain_deploy settings
+variable xla_mem_fraction  equal 0.90
+variable comm_cutoff       equal 14.0
+variable ghost_mult        equal 1.2
+variable edge_mult         equal 1.1
+
+units           real
+atom_style      atomic
+dimension       3
+boundary        p p p
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes once no
+
+read_data       ${data_file}
+mass * 12.01
+
+comm_modify     cutoff ${comm_cutoff}
+pair_style      chemtrain_deploy cuda12 ${xla_mem_fraction}
+pair_coeff      * * ${model_file} ${ghost_mult} ${edge_mult}
+
+timestep        ${dt_fs}
+
+thermo          5000
+thermo_style    custom step temp press pe ke etotal
+
+min_style       cg
+minimize        1.0e-4 1.0e-6 200 2000
+
+velocity        all create ${temp} ${langevin_seed} mom yes rot yes dist gaussian
+fix             int  all nve
+fix             bath all langevin ${temp} ${temp} ${langevin_damp_fs} ${langevin_seed} zero yes
+
+run             ${eq_steps}
+write_restart   ${dump_dir}/restart.eq
+
+reset_timestep  0
+dump            dprod all custom ${sample_stride} ${dump_dir}/ca_tica.dump id type xu yu zu
+dump_modify     dprod sort id format line "%d %d %.8f %.8f %.8f"
+
+run             ${sample_steps}
+write_restart   ${dump_dir}/restart.prod

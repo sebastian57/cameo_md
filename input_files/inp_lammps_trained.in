@@ -25,7 +25,7 @@ velocity        all create 320.0 4928459 rot no dist gaussian
 fix             1 all nvt temp 320.0 320.0 200.0
 timestep        1.0 # 0.1 # 1.0
 
-dump            traj all custom 100 dump.out id type x y z fx fy fz 
+dump            traj all custom 100 dump.out id type xu yu zu fx fy fz 
 dump_modify     traj sort id
 
 run             10000

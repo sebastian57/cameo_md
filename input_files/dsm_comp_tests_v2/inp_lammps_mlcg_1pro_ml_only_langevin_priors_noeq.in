@@ -1,0 +1,63 @@
+# MLCG simulation: ML+priors force field with immediate Langevin dynamics.
+#
+# No minimization or equilibration is performed here. The input loads the
+# provided configuration, assigns velocities, and starts NVE + Langevin
+# dynamics immediately.
+#
+# Langevin: damp = 50 fs  -> gamma = 1000/50 = 20 ps^-1
+#
+# Box: protein centered at origin, clearance = model_cutoff(12) + padding(5) = 17 Ang per side.
+#   Regenerate with: python lmp_input_gen.py --frame 0 --cutoff 12.0 --padding 5.0
+#
+# comm_cutoff = 12.0 = model_cutoff(10 Ang training) + neighbor_skin(2 Ang)
+
+variable data_file         string "/p/project1/cameo/schmidt36/cameo_md/structures/config_4z.data"
+variable model_file        string "/p/project1/cameo/schmidt36/cameo_md/models/1pro_4zoh_comparison_ml_priors_symbolic.mlir"
+variable dump_dir          string "/p/project1/cameo/schmidt36/cameo_md/outputs/single_runs/manual_1pro_ml_only_langevin/priors_noeq"
+
+variable temp              equal 320.0
+variable dt_fs             equal 0.1
+variable sample_steps      equal 1000000
+variable sample_stride     equal 50
+
+variable langevin_damp_fs  equal 50.0   # gamma = 1000/50 = 20 ps^-1
+
+# chemtrain_deploy settings
+variable xla_mem_fraction  equal 0.90
+variable comm_cutoff       equal 12.0
+variable ghost_mult        equal 1.2
+variable edge_mult         equal 1.1
+
+units           real
+atom_style      atomic
+dimension       3
+boundary        p p p
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes once no
+
+read_data       ${data_file}
+
+# C-alpha force matching: forces are kept on C-alpha atoms (not COM-aggregated),
+# so the correct mass is the carbon mass 12.01 Da, not the residue mass ~110 Da.
+mass * 12.01
+
+comm_modify     cutoff ${comm_cutoff}
+pair_style      chemtrain_deploy cuda12 ${xla_mem_fraction}
+pair_coeff      * * ${model_file} ${ghost_mult} ${edge_mult}
+
+timestep        ${dt_fs}
+
+thermo          5000
+thermo_style    custom step temp press pe ke etotal
+
+velocity        all create ${temp} 42 mom yes rot yes dist gaussian
+fix             int  all nve
+fix             bath all langevin ${temp} ${temp} ${langevin_damp_fs} 24680 zero yes
+
+reset_timestep  0
+dump            dprod all custom ${sample_stride} ${dump_dir}/ca_tica.dump id type xu yu zu fx fy fz
+dump_modify     dprod sort id format line "%d %d %.8f %.8f %.8f %.8f %.8f %.8f"
+
+run             ${sample_steps}
+write_restart   ${dump_dir}/restart.prod

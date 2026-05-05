@@ -1,0 +1,112 @@
+# Classical CHARMM22+CMAP NVT-Langevin MD of 4zohB01 (protein + TIP3P water)
+# for TICA comparison with the CG ML simulation.
+#
+# This script runs free CA dynamics (no frozen atoms) to sample conformational space.
+# Only CA atoms are written to the output dump, so the resulting file is directly
+# comparable to the CG ML dump (cg_forces.dump) in tica_from_lammps_dump.py.
+#
+# Structure: full atomistic protein + water from the forcevar run directory.
+# Note: starts from frame 327 of mdCATH h5 (forcevar run initial structure),
+# while the CG ML simulation uses frame 44 of the training NPZ. Both are valid
+# starting configurations of 4zohB01 for ensemble/TICA comparison.
+#
+# Run:
+#   sbatch cameo_md/submit_one_lammps_test.sh cameo_md/inp_lammps_charmm22_tica.in
+# (this uses a booster GPU node; classical MD does not use the GPU, so a CPU
+#  partition would be more resource-efficient if available)
+#
+# After the run, analyse with:
+#   python cameo_md/tica_from_lammps_dump.py \
+#       --dump cameo_md/outputs/charmm22_tica/ca_tica.dump \
+#       --outdir cameo_md/tica_results/charmm22 --prefix charmm22 \
+#       --lagtime 10 --n-pairs 200 --pair-seed 42
+#
+# And compare to the CG ML result:
+#   python cameo_md/tica_from_lammps_dump.py \
+#       --dump cameo_md/outputs/training_md_testing/cg_forces.dump \
+#       --outdir cameo_md/tica_results/cg_ml --prefix cg_ml \
+#       --lagtime 10 --n-pairs 200 --pair-seed 42
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+variable data_file  string "/p/project1/cameo/schmidt36/cameo_md/runs/forcevar_320K/4zohB01/data.protein"
+variable cmap_file  string "/p/project1/cameo/schmidt36/cameo_md/runs/forcevar_320K/4zohB01/charmm22.cmap"
+variable dump_dir   string "/p/project1/cameo/schmidt36/cameo_md/outputs/charmm22_tica"
+
+# ---------------------------------------------------------------------------
+# MD settings
+# ---------------------------------------------------------------------------
+variable temp          equal 320.0
+variable dt_fs         equal 1.0
+variable eq_steps      equal 5000     # 5 ps equilibration (structure already equilibrated)
+variable sample_steps  equal 200000   # 200 ps production → 4000 CA frames at stride 50
+variable sample_stride equal 50       # 50 fs per frame
+
+# ---------------------------------------------------------------------------
+# Force field setup
+# ---------------------------------------------------------------------------
+units           real
+atom_style      full
+boundary        p p p
+
+bond_style      harmonic
+angle_style     charmm
+dihedral_style  charmm
+improper_style  harmonic
+
+pair_style      lj/charmm/coul/long 8.0 12.0
+pair_modify     mix arithmetic
+kspace_style    pppm 1.0e-6
+special_bonds   charmm
+
+fix             cmap all cmap ${cmap_file}
+fix_modify      cmap energy yes
+read_data       ${data_file} fix cmap crossterm CMAP
+
+# ---------------------------------------------------------------------------
+# Atom groups — CA ids from 4zohB01 (auto-generated, 53 CA atoms)
+# ---------------------------------------------------------------------------
+group ca id 3 20 43 57 69 91 111 118 139 155 176 188 200 214 233 247 262 272 291 306 326 345 360 375 392 409 421 431 457 469 488 498 505 512 530 541 560 581 593 610 629 651 670 694 713 732 758 770 781 802 821 837 852
+# protein = all heavy + H atoms up to ID 868; excludes water/ions
+group protein id 1:868
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes
+
+timestep        ${dt_fs}
+
+# ---------------------------------------------------------------------------
+# Minimization — all atoms free (no frozen CA for TICA)
+# ---------------------------------------------------------------------------
+min_style       cg
+minimize        1.0e-4 1.0e-6 500 5000
+
+# ---------------------------------------------------------------------------
+# NVT-Langevin equilibration — full system
+# ---------------------------------------------------------------------------
+velocity        all create ${temp} 42 mom yes rot yes dist gaussian
+
+fix             int  all nve
+fix             bath all langevin ${temp} ${temp} 100.0 24680 zero yes
+fix             sh   all shake 1.0e-6 500 0 m 1.0 a 110
+
+thermo          5000
+thermo_style    custom step temp press pe ke etotal
+
+run             ${eq_steps}
+write_restart   ${dump_dir}/restart.eq
+
+# ---------------------------------------------------------------------------
+# Production — CA-only dump for TICA
+# ---------------------------------------------------------------------------
+reset_timestep  0
+
+# Dump only CA atom coordinates — directly readable by tica_from_lammps_dump.py
+# and comparable to the CG ML dump (same protein, same number of CA beads)
+dump            dca ca custom ${sample_stride} ${dump_dir}/ca_tica.dump id type xu yu zu
+dump_modify     dca sort id format line "%d %d %.8f %.8f %.8f"
+
+run             ${sample_steps}
+
+write_restart   ${dump_dir}/restart.prod

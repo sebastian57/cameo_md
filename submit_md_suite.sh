@@ -22,7 +22,7 @@ Required:
 Optional:
   --max_concurrent   Max concurrent array tasks (default: 4)
   --dataset          NPZ dataset path (default: $DATASET_DEFAULT)
-  --suite_dir        Output suite directory (default: cameo_md/runs/md_suite_<timestamp>)
+  --suite_dir        Output suite directory (default: cameo_md/outputs/md_suites/<input>_<timestamp>)
   --seed             RNG seed for random selection (default: 12345)
   --safety_factor    Structure box safety factor passed to lmp_input_gen.py (default: 1.20)
   --min_half_width   Minimum half-width for auto box mode (default: 20.0)
@@ -123,7 +123,8 @@ INPUT_FILE="$(realpath "$INPUT_FILE")"
 DATASET="$(realpath "$DATASET")"
 
 if [[ -z "$SUITE_DIR" ]]; then
-    SUITE_DIR="$SCRIPT_DIR/runs/md_suite_$(date +%Y%m%d_%H%M%S)"
+    INPUT_BASE="$(basename "${INPUT_FILE%.in}")"
+    SUITE_DIR="$SCRIPT_DIR/outputs/md_suites/${INPUT_BASE}_$(date +%Y%m%d_%H%M%S)"
 fi
 SUITE_DIR="$(realpath -m "$SUITE_DIR")"
 mkdir -p "$SUITE_DIR"
@@ -185,6 +186,8 @@ for idx in "${FRAMES[@]}"; do
 
     STRUCT_FILE="$RUN_DIR/structure.data"
     RUN_INPUT="$RUN_DIR/$(basename "$INPUT_FILE")"
+    RUN_DUMPDIR="$RUN_DIR/dumps"
+    mkdir -p "$RUN_DUMPDIR"
 
     bash -lc "source '$LOAD_MODULES' && source '$CLEAN_ENV' && \
       python '$GEN_SCRIPT' \
@@ -203,6 +206,11 @@ for idx in "${FRAMES[@]}"; do
     fi
 
     sed -i "s|^variable[[:space:]]\+data_file[[:space:]]\+string[[:space:]]\+.*$|variable data_file         string \"$STRUCT_FILE\"|" "$RUN_INPUT"
+    if grep -Eq '^variable[[:space:]]+dump_dir[[:space:]]+string' "$RUN_INPUT"; then
+        sed -i "s|^variable[[:space:]]\\+dump_dir[[:space:]]\\+string[[:space:]]\\+.*$|variable dump_dir          string \"$RUN_DUMPDIR\"|" "$RUN_INPUT"
+    else
+        printf '\nvariable dump_dir          string "%s"\n' "$RUN_DUMPDIR" >> "$RUN_INPUT"
+    fi
     printf "%s\t%s\t%s\n" "$RUN_DIR" "$RUN_INPUT" "$idx" >> "$MANIFEST"
 done
 

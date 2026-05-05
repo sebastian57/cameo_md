@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--frame",
         type=int,
-        default=2234,
+        default=0,
         help="Frame index to export.",
     )
     parser.add_argument(
@@ -23,49 +23,47 @@ def parse_args() -> argparse.Namespace:
         help="Output LAMMPS data path (default: structures/config_<frame>.data).",
     )
     parser.add_argument(
-        "--box-mode",
-        choices=["auto", "manual"],
-        default="auto",
-        help="How to set box bounds. auto uses coordinate extents with a safety factor.",
+        "--cutoff",
+        type=float,
+        default=12.0,
+        help="Model pair cutoff in Å. Box is padded so no atom is within this distance "
+             "of a periodic image. Should match the LAMMPS pair_style cutoff "
+             "(training cutoff + any buffer). Default: 12.0.",
     )
     parser.add_argument(
-        "--safety-factor",
+        "--padding",
         type=float,
-        default=1.20,
-        help="Multiplier for farthest absolute extent in each axis when --box-mode auto is used.",
+        default=5.0,
+        help="Extra clearance in Å beyond the cutoff to the box edge (default: 5.0).",
     )
-    parser.add_argument(
-        "--min-half-width",
-        type=float,
-        default=20.0,
-        help="Minimum half box width per axis for auto mode.",
-    )
-    parser.add_argument("--xlo", type=float, default=-400.0)
-    parser.add_argument("--xhi", type=float, default=400.0)
-    parser.add_argument("--ylo", type=float, default=-400.0)
-    parser.add_argument("--yhi", type=float, default=400.0)
-    parser.add_argument("--zlo", type=float, default=-400.0)
-    parser.add_argument("--zhi", type=float, default=400.0)
     return parser.parse_args()
 
 
-def _compute_auto_bounds(pos: np.ndarray, safety_factor: float, min_half_width: float) -> tuple[float, float, float, float, float, float]:
-    if safety_factor <= 1.0:
-        raise ValueError("--safety-factor must be > 1.0")
-    if min_half_width <= 0.0:
-        raise ValueError("--min-half-width must be > 0")
+def _center_and_box(
+    pos: np.ndarray, cutoff: float, padding: float
+) -> tuple[np.ndarray, float, float, float, float, float, float]:
+    """
+    Center protein at origin and compute symmetric box bounds such that no
+    atom is within (cutoff + padding) Å of the nearest periodic image.
 
-    max_abs = np.max(np.abs(pos), axis=0)
-    half_width = np.maximum(max_abs * safety_factor, min_half_width)
+    The half-width in each axis = max_extent_from_center + cutoff + padding,
+    where max_extent is the farthest atom from the centroid along that axis.
+    """
+    centroid = pos.mean(axis=0)
+    pos_centered = pos - centroid
+
+    # Per-axis maximum absolute displacement from centroid
+    max_extent = np.max(np.abs(pos_centered), axis=0)  # (3,)
+
+    half_width = max_extent + cutoff + padding
 
     xh, yh, zh = float(half_width[0]), float(half_width[1]), float(half_width[2])
-    return -xh, xh, -yh, yh, -zh, zh
+    return pos_centered, -xh, xh, -yh, yh, -zh, zh
 
 
 def main() -> None:
     args = parse_args()
 
-    # NPZ contains object arrays (e.g. resname/paths/mappings), so pickle support is required.
     data = np.load(args.dataset, allow_pickle=True)
 
     n_frames = data["R"].shape[0]
@@ -104,17 +102,28 @@ def main() -> None:
             f"species length ({species_all.shape[0]}) does not match atom count ({n_total}) for frame {args.frame}"
         )
 
-    # Remap species on kept atoms so LAMMPS types are contiguous 1..N.
+    # Preserve the original dataset species IDs exactly.
+    # The exported MLIR path expects LAMMPS atom types to be species + 1,
+    # so any local remapping would change model semantics.
     species_kept = species_all[valid]
-    unique_species = sorted(set(int(x) for x in species_kept.tolist()))
-    species_to_type = {sp: idx + 1 for idx, sp in enumerate(unique_species)}
-    lammps_types = np.array([species_to_type[int(sp)] for sp in species_kept], dtype=np.int32)
-    n_species = len(unique_species)
+    if species_kept.size == 0:
+        raise ValueError(f"no valid species found for frame {args.frame}")
+    if np.min(species_kept) < 0:
+        raise ValueError(
+            f"species IDs must be non-negative, got range "
+            f"[{int(np.min(species_kept))}, {int(np.max(species_kept))}]"
+        )
+    lammps_types = np.asarray(species_kept, dtype=np.int32) + 1
+    n_species = int(np.max(species_kept)) + 1
 
-    if args.box_mode == "auto":
-        xlo, xhi, ylo, yhi, zlo, zhi = _compute_auto_bounds(pos, args.safety_factor, args.min_half_width)
-    else:
-        xlo, xhi, ylo, yhi, zlo, zhi = args.xlo, args.xhi, args.ylo, args.yhi, args.zlo, args.zhi
+    # Center protein at origin and compute box with guaranteed clearance.
+    pos_centered, xlo, xhi, ylo, yhi, zlo, zhi = _center_and_box(
+        pos, args.cutoff, args.padding
+    )
+
+    max_extent = np.max(np.abs(pos_centered), axis=0)
+    clearance = np.array([xhi, yhi, zhi]) - max_extent  # should equal cutoff + padding
+    box_lengths = np.array([xhi - xlo, yhi - ylo, zhi - zlo])
 
     out_path = Path(args.out) if args.out else Path(f"structures/config_{args.frame}.data")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,7 +138,7 @@ def main() -> None:
         f.write("Atoms\n\n")
 
         for idx in range(n_atoms):
-            x, y, z = pos[idx]
+            x, y, z = pos_centered[idx]
             f.write(f"{idx + 1} {int(lammps_types[idx])} {x:.8f} {y:.8f} {z:.8f}\n")
 
     print(f"dataset      : {args.dataset}")
@@ -137,10 +146,13 @@ def main() -> None:
     print(f"atoms total  : {n_total}")
     print(f"atoms kept   : {n_atoms}")
     print(f"atom types   : {n_species}")
-    print(f"box mode     : {args.box_mode}")
-    print(f"box x        : [{xlo:.6f}, {xhi:.6f}]")
-    print(f"box y        : [{ylo:.6f}, {yhi:.6f}]")
-    print(f"box z        : [{zlo:.6f}, {zhi:.6f}]")
+    print(f"species min  : {int(np.min(species_kept))}")
+    print(f"species max  : {int(np.max(species_kept))}")
+    print(f"cutoff       : {args.cutoff} Å  (pair interaction range)")
+    print(f"padding      : {args.padding} Å  (extra clearance beyond cutoff)")
+    print(f"box x        : [{xlo:.3f}, {xhi:.3f}]  width={box_lengths[0]:.3f} Å  clearance={clearance[0]:.3f} Å")
+    print(f"box y        : [{ylo:.3f}, {yhi:.3f}]  width={box_lengths[1]:.3f} Å  clearance={clearance[1]:.3f} Å")
+    print(f"box z        : [{zlo:.3f}, {zhi:.3f}]  width={box_lengths[2]:.3f} Å  clearance={clearance[2]:.3f} Å")
     print(f"wrote        : {out_path}")
 
 

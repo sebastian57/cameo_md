@@ -12,8 +12,8 @@
 source /p/project1/cameo/schmidt36/load_modules.sh
 source /p/project1/cameo/schmidt36/set_lammps_paths.sh
 
-PROJECT_ROOT=/p/project1/cameo/schmidt36/cameo_md/runs/4q5wA02_charmm22_cmap_fixed
-INPUT_FILE="$PROJECT_ROOT/in.ca_force_variance.lmp"
+PROJECT_ROOT=/p/project1/cameo/schmidt36/cameo_md
+INPUT_FILE="$PROJECT_ROOT/inp_lammps_trained_forcevarlike.in"
 cd "$PROJECT_ROOT"
 
 export MPICH_GPU_SUPPORT_ENABLED=0

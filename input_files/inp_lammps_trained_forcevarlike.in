@@ -1,0 +1,68 @@
+# Trained CG model MD (chemtrain_deploy), aligned to CHARMM22 TICA protocol.
+#
+# Comparison-aligned settings vs CHARMM22 TICA run:
+# - same temperature (320 K)
+# - same production length (200000 steps)
+# - same dump stride for TICA (50)
+# - CA-coordinate dump format (id type xu yu zu)
+
+variable data_file         string "/p/project1/cameo/schmidt36/cameo_md/structures/config_44.data"
+variable model_file        string "/p/project1/cameo/schmidt36/cameo_md/models/training_md_testing_cueq_fast_tiled_no_priors_symbolic_reexport.mlir"
+variable dump_dir          string "/p/project1/cameo/schmidt36/cameo_md/outputs/training_md_testing/"
+
+variable temp              equal 320.0
+variable dt_fs             equal 1.0
+variable eq_steps          equal 5000
+variable sample_steps      equal 200000
+variable sample_stride     equal 50
+variable langevin_damp_fs  equal 100.0
+
+# chemtrain_deploy settings
+variable xla_mem_fraction  equal 0.90
+variable comm_cutoff       equal 14.0
+variable ghost_mult        equal 1.2
+variable edge_mult         equal 1.1
+
+units           real
+atom_style      atomic
+dimension       3
+boundary        s s s
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes once no
+
+read_data       ${data_file}
+
+# Keep only if your data file does not provide masses.
+mass * 12.01
+
+comm_modify     cutoff ${comm_cutoff}
+pair_style      chemtrain_deploy cuda12 ${xla_mem_fraction}
+pair_coeff      * * ${model_file} ${ghost_mult} ${edge_mult}
+
+timestep        ${dt_fs}
+
+thermo          5000
+thermo_style    custom step temp press pe ke etotal
+
+# --- Minimization ---
+min_style       cg
+minimize        1.0e-4 1.0e-6 200 2000
+
+# --- NVE + Langevin equilibration ---
+velocity        all create ${temp} 42 mom yes rot yes dist gaussian
+fix             int  all nve
+fix             bath all langevin ${temp} ${temp} ${langevin_damp_fs} 24680 zero yes
+
+run             ${eq_steps}
+write_restart   ${dump_dir}/restart.eq
+
+# --- Production sampling (TICA-compatible dump) ---
+reset_timestep  0
+
+dump            dprod all custom ${sample_stride} ${dump_dir}/ca_tica.dump id type xu yu zu
+dump_modify     dprod sort id format line "%d %d %.8f %.8f %.8f"
+
+run             ${sample_steps}
+
+write_restart   ${dump_dir}/restart.prod

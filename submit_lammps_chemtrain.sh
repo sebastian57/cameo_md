@@ -13,8 +13,8 @@ source /p/project1/cameo/schmidt36/env_cueq_allegro_opt/bin/activate
 source /p/project1/cameo/schmidt36/set_lammps_paths.sh
 
 # Defaults for standalone usage.
-PROJECT_ROOT=${PROJECT_ROOT:-/p/project1/cameo/schmidt36/testing_dir}
-INPUT_FILE=${INPUT_FILE:-$PROJECT_ROOT/inp_lammps_trained.in}
+PROJECT_ROOT=${PROJECT_ROOT:-/p/project1/cameo/schmidt36/cameo_md}
+INPUT_FILE=${INPUT_FILE:-$PROJECT_ROOT/inp_lammps_trained_forcevarlike.in}
 
 # Optional suite mode: map each array task to a run directory and input file.
 # SUITE_MANIFEST format (tab-separated, one line per task):

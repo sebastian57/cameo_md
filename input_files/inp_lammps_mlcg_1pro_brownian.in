@@ -1,0 +1,77 @@
+# MLCG simulation: 1pro_alltemp model, Brownian dynamics (overdamped Langevin).
+#
+# Implements:  dx = -(1/gamma) * dA/dr * dt  +  sqrt(2 kbT / gamma) * dW_t
+# where gamma = m / damp (friction coefficient), dW_t is Gaussian noise.
+# This is the overdamped limit of Langevin: no inertia, purely diffusive motion.
+#
+# Data file, model file, and dump directory are patched by prepare_mlcg_runs.py.
+#
+# Model: 1pro_alltemp_cueq_fast_tiled (ML-only, no priors)
+# Integrator: fix brownian (BROWNIAN package required; verify with `lmp -h | grep brownian`)
+#
+# Fallback if BROWNIAN package is unavailable: replace the brownian block below with:
+#   variable langevin_damp_fs equal 1000.0   # high friction -> overdamped approximation
+#   fix int  all nve
+#   fix bath all langevin ${temp} ${temp} ${langevin_damp_fs} 24680 zero yes
+# Then re-add: velocity all create ${temp} 42 mom yes rot yes dist gaussian
+
+variable data_file         string "/p/project1/cameo/schmidt36/cameo_md/structures/config_44.data"
+variable model_file        string "/p/project1/cameo/schmidt36/cameo_cg/local_work/outputs/1pro_alltemp/cueq_fast_tiled/exports/1pro_alltemp_cueq_fast_tiled.mlir"
+variable dump_dir          string "/p/project1/cameo/schmidt36/cameo_md/outputs/exp_1pro_tica/mlcg_brownian"
+
+variable temp              equal 320.0
+variable dt_fs             equal 1.0
+# Friction timescale: D = kbT * damp / m.  At 320K, mass=12.01 amu, damp=100 fs:
+#   D = (0.634 kcal/mol) * 100 fs / 12.01 amu ~ 0.53 Angstrom^2 / ps
+# Adjust to change effective diffusion coefficient.
+variable langevin_damp_fs  equal 1000.0
+variable eq_steps          equal 5000
+variable sample_steps      equal 200000
+variable sample_stride     equal 50
+variable brownian_seed     equal 24680
+
+# chemtrain_deploy settings
+variable xla_mem_fraction  equal 0.90
+variable comm_cutoff       equal 14.0
+variable ghost_mult        equal 1.2
+variable edge_mult         equal 1.1
+
+units           real
+atom_style      atomic
+dimension       3
+boundary        p p p
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes once no
+
+read_data       ${data_file}
+mass * 12.01
+
+comm_modify     cutoff ${comm_cutoff}
+pair_style      chemtrain_deploy cuda12 ${xla_mem_fraction}
+pair_coeff      * * ${model_file} ${ghost_mult} ${edge_mult}
+
+timestep        ${dt_fs}
+
+thermo          5000
+thermo_style    custom step temp press pe ke etotal
+
+# Minimize before dynamics to relax any strained starting geometry.
+# No integrator fix is active during minimize.
+min_style       cg
+minimize        1.0e-4 1.0e-6 200 2000
+
+# High-friction Langevin as overdamped approximation (damp=1000 fs).
+velocity        all create ${temp} ${brownian_seed} mom yes rot yes dist gaussian
+fix             int  all nve
+fix             bath all langevin ${temp} ${temp} ${langevin_damp_fs} ${brownian_seed} zero yes
+
+run             ${eq_steps}
+write_restart   ${dump_dir}/restart.eq
+
+reset_timestep  0
+dump            dprod all custom ${sample_stride} ${dump_dir}/ca_tica.dump id type xu yu zu
+dump_modify     dprod sort id format line "%d %d %.8f %.8f %.8f"
+
+run             ${sample_steps}
+write_restart   ${dump_dir}/restart.prod
